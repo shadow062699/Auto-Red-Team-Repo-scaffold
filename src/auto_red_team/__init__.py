@@ -1,0 +1,1 @@
+from auto_red_team.checks import dockerfile_checks
