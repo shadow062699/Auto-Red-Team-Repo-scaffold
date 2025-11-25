@@ -1,66 +1,84 @@
-# analyzer.py
-# --- Added expanded ruleset implementations below ---
-# Kubernetes, Terraform, IAM, and general config checks integrated — basic rule engine + severity mapping
-from dataclasses import dataclass
+# src/auto_red_team/analyzer.py
+"""
+Analyzer: auto-discovers check modules under auto_red_team.checks
+and normalizes findings to a consistent schema:
+
+{
+  "file": "<path>",
+  "line": <int>,
+  "code": "<FINDING_CODE>",
+  "severity": "Critical|High|Medium|Low|Info",
+  "short": "<one-line summary>",
+  "detail": "<longer description>",
+  "remediation": "<suggested fix>"
+}
+"""
+import importlib
+import pkgutil
+from pathlib import Path
 from typing import List, Dict, Any
 
-
-SEVERITY_MAP = {
-"IMAGE_USES_ROOT_USER": "High",
-"ENV_CONTAINS_PLAIN_SECRET": "Critical",
-"NGINX_WEAK_TLS": "High",
-"CORS_WILDCARD": "Medium",
-}
-
-
-@dataclass
-class Finding:
-file: str
-line: int
-code: str
-severity: str
-short: str
-detail: str
-remediation: str
-
+from . import checks as checks_pkg
 
 class Analyzer:
-def analyze(self, path, text: str) -> List[Dict[str, Any]]:
-findings = []
-# very simple Dockerfile check
-if path.name == "Dockerfile":
-lines = text.splitlines()
-for i, line in enumerate(lines, start=1):
-if line.strip().lower().startswith("user root") or "USER root" in line:
-f = Finding(
-file=str(path), line=i, code="IMAGE_USES_ROOT_USER",
-severity=SEVERITY_MAP.get("IMAGE_USES_ROOT_USER","High"),
-short="Image runs as root",
-detail="The Docker image config sets the user to root or does not set a non-root user.",
-remediation="Create a non-root user and switch to it in the Dockerfile."
-)
-findings.append(f.__dict__)
-# simple .env secret detection
-if path.suffix == ".env" or path.name.endswith('.env'):
-for i, line in enumerate(text.splitlines(), start=1):
-if "SECRET" in line.upper() or "PASSWORD" in line.upper():
-if "=" in line and len(line.split("=",1)[1].strip())>0:
-f = Finding(
-file=str(path), line=i, code="ENV_CONTAINS_PLAIN_SECRET",
-severity=SEVERITY_MAP.get("ENV_CONTAINS_PLAIN_SECRET","Critical"),
-short="Hard-coded secret",
-detail="A value resembling a secret appears in an env file. Storing secrets in plaintext increases risk of leakage.",
-remediation="Use a secret manager or remove secrets from version control."
-)
-findings.append(f.__dict__)
-# nginx quickcheck
-if path.name.startswith("nginx") or "nginx" in str(path).lower():
-if "ssl_protocols" in text and "TLSv1" in text:
-f = Finding(file=str(path), line=1, code="NGINX_WEAK_TLS",
-severity=SEVERITY_MAP.get("NGINX_WEAK_TLS","High"),
-short="Weak TLS protocol present",
-detail="The nginx config allows obsolete TLS versions like TLSv1.0/1.1.",
-remediation="Disable TLSv1.0 and TLSv1.1 and prefer TLSv1.2+ with strong ciphers."
-)
-findings.append(f.__dict__)
-return findings
+    def __init__(self):
+        # Nothing heavy on init; checks package will be used on demand
+        self._modules = self._discover_check_modules()
+
+    def _discover_check_modules(self) -> List:
+        modules = []
+        package_path = Path(checks_pkg.__file__).parent
+        for module_info in pkgutil.iter_modules([str(package_path)]):
+            full_name = f"{checks_pkg.__package__}.{module_info.name}"
+            try:
+                m = importlib.import_module(full_name)
+            except Exception:
+                # ignore modules that fail to import (but optionally log)
+                continue
+            modules.append(m)
+        return modules
+
+    def analyze(self, path: Path, content: str) -> List[Dict[str, Any]]:
+        """
+        Run all checks for the given file content. Each check module should
+        expose one or more check functions that accept (path, text) and return
+        a list of finding dicts in the normalized schema (or similar).
+        We'll accept small variations but normalize here.
+        """
+        findings: List[Dict[str, Any]] = []
+
+        # If checks package exposes run_all_checks use it (convenience)
+        if hasattr(checks_pkg, "run_all_checks"):
+            raw = checks_pkg.run_all_checks(path, content)
+            findings.extend(self._normalize(raw))
+            return findings
+
+        # Otherwise call discoverd modules and common function names
+        for m in self._modules:
+            for fname in ("check_dockerfile", "check_env_file", "check_nginx",
+                          "check_k8s", "check_terraform", "check_iam", "check_all"):
+                if hasattr(m, fname):
+                    try:
+                        raw = getattr(m, fname)(path, content)
+                        findings.extend(self._normalize(raw))
+                    except Exception:
+                        # ignore failing checks to keep scanning resilient
+                        continue
+        return findings
+
+    def _normalize(self, raw_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Normalize variety of finding dict shapes into a canonical schema"""
+        out = []
+        for r in raw_list:
+            # simple tolerant mapping
+            item = {
+                "file": r.get("file") or r.get("path") or "",
+                "line": int(r.get("line") or r.get("lineno") or 0),
+                "code": r.get("code") or r.get("id") or r.get("finding") or "UNKNOWN",
+                "severity": r.get("severity") or r.get("level") or "Info",
+                "short": r.get("short") or r.get("title") or "",
+                "detail": r.get("detail") or r.get("description") or "",
+                "remediation": r.get("remediation") or r.get("fix") or "",
+            }
+            out.append(item)
+        return out
